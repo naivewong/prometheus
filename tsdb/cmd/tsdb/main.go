@@ -50,23 +50,24 @@ func execute() (err error) {
 	var (
 		defaultDBPath = filepath.Join("benchout", "storage")
 
-		cli                  = kingpin.New(filepath.Base(os.Args[0]), "CLI tool for tsdb")
-		benchCmd             = cli.Command("bench", "run benchmarks")
-		benchWriteCmd        = benchCmd.Command("write", "run a write performance benchmark")
-		benchWriteOutPath    = benchWriteCmd.Flag("out", "set the output path").Default("benchout").String()
-		benchWriteNumMetrics = benchWriteCmd.Flag("metrics", "number of metrics to read").Default("10000").Int()
-		benchSamplesFile     = benchWriteCmd.Arg("file", "input file with samples data, default is ("+filepath.Join("..", "..", "testdata", "20kseries.json")+")").Default(filepath.Join("..", "..", "testdata", "20kseries.json")).String()
-		listCmd              = cli.Command("ls", "list db blocks")
-		listCmdHumanReadable = listCmd.Flag("human-readable", "print human readable values").Short('h').Bool()
-		listPath             = listCmd.Arg("db path", "database path (default is "+defaultDBPath+")").Default(defaultDBPath).String()
-		analyzeCmd           = cli.Command("analyze", "analyze churn, label pair cardinality.")
-		analyzePath          = analyzeCmd.Arg("db path", "database path (default is "+defaultDBPath+")").Default(defaultDBPath).String()
-		analyzeBlockID       = analyzeCmd.Arg("block id", "block to analyze (default is the last block)").String()
-		analyzeLimit         = analyzeCmd.Flag("limit", "how many items to show in each list").Default("20").Int()
-		dumpCmd              = cli.Command("dump", "dump samples from a TSDB")
-		dumpPath             = dumpCmd.Arg("db path", "database path (default is "+defaultDBPath+")").Default(defaultDBPath).String()
-		dumpMinTime          = dumpCmd.Flag("min-time", "minimum timestamp to dump").Default(strconv.FormatInt(math.MinInt64, 10)).Int64()
-		dumpMaxTime          = dumpCmd.Flag("max-time", "maximum timestamp to dump").Default(strconv.FormatInt(math.MaxInt64, 10)).Int64()
+		cli                    = kingpin.New(filepath.Base(os.Args[0]), "CLI tool for tsdb")
+		benchCmd               = cli.Command("bench", "run benchmarks")
+		benchWriteCmd          = benchCmd.Command("write", "run a write performance benchmark")
+		benchWriteOutPath      = benchWriteCmd.Flag("out", "set the output path").Default("benchout").String()
+		benchWriteNumMetrics   = benchWriteCmd.Flag("metrics", "number of metrics to read").Default("10000").Int()
+		benchWriteSingleThread = benchWriteCmd.Flag("single-thread", "use single thread to write data").Default("false").Bool()
+		benchSamplesFile       = benchWriteCmd.Arg("file", "input file with samples data, default is ("+filepath.Join("..", "..", "testdata", "20kseries.json")+")").Default(filepath.Join("..", "..", "testdata", "20kseries.json")).String()
+		listCmd                = cli.Command("ls", "list db blocks")
+		listCmdHumanReadable   = listCmd.Flag("human-readable", "print human readable values").Short('h').Bool()
+		listPath               = listCmd.Arg("db path", "database path (default is "+defaultDBPath+")").Default(defaultDBPath).String()
+		analyzeCmd             = cli.Command("analyze", "analyze churn, label pair cardinality.")
+		analyzePath            = analyzeCmd.Arg("db path", "database path (default is "+defaultDBPath+")").Default(defaultDBPath).String()
+		analyzeBlockID         = analyzeCmd.Arg("block id", "block to analyze (default is the last block)").String()
+		analyzeLimit           = analyzeCmd.Flag("limit", "how many items to show in each list").Default("20").Int()
+		dumpCmd                = cli.Command("dump", "dump samples from a TSDB")
+		dumpPath               = dumpCmd.Arg("db path", "database path (default is "+defaultDBPath+")").Default(defaultDBPath).String()
+		dumpMinTime            = dumpCmd.Flag("min-time", "minimum timestamp to dump").Default(strconv.FormatInt(math.MinInt64, 10)).Int64()
+		dumpMaxTime            = dumpCmd.Flag("max-time", "maximum timestamp to dump").Default(strconv.FormatInt(math.MaxInt64, 10)).Int64()
 	)
 
 	logger := log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
@@ -75,10 +76,11 @@ func execute() (err error) {
 	switch kingpin.MustParse(cli.Parse(os.Args[1:])) {
 	case benchWriteCmd.FullCommand():
 		wb := &writeBenchmark{
-			outPath:     *benchWriteOutPath,
-			numMetrics:  *benchWriteNumMetrics,
-			samplesFile: *benchSamplesFile,
-			logger:      logger,
+			outPath:      *benchWriteOutPath,
+			numMetrics:   *benchWriteNumMetrics,
+			samplesFile:  *benchSamplesFile,
+			logger:       logger,
+			singleThread: *benchWriteSingleThread,
 		}
 		return wb.run()
 	case listCmd.FullCommand():
@@ -141,10 +143,11 @@ func execute() (err error) {
 }
 
 type writeBenchmark struct {
-	outPath     string
-	samplesFile string
-	cleanup     bool
-	numMetrics  int
+	outPath      string
+	samplesFile  string
+	cleanup      bool
+	numMetrics   int
+	singleThread bool
 
 	storage *tsdb.DB
 
@@ -209,7 +212,11 @@ func (b *writeBenchmark) run() error {
 		if err := b.startProfiling(); err != nil {
 			return err
 		}
-		total, err = b.ingestScrapes(labels, 3000)
+		if b.singleThread {
+			total, err = b.ingestScrapesSingleThread(labels, 3000)
+		} else {
+			total, err = b.ingestScrapes(labels, 3000)
+		}
 		if err != nil {
 			return err
 		}
@@ -270,6 +277,62 @@ func (b *writeBenchmark) ingestScrapes(lbls []labels.Labels, scrapeCount int) (u
 		wg.Wait()
 	}
 	fmt.Println("ingestion completed")
+
+	return total, nil
+}
+
+func (b *writeBenchmark) ingestScrapesSingleThread(lbls []labels.Labels, scrapeCount int) (uint64, error) {
+	type sample struct {
+		labels labels.Labels
+		value  int64
+		ref    *uint64
+	}
+
+	var total uint64
+	var ts    int64
+
+	scrape := make([]*sample, 0, len(lbls))
+
+	for _, m := range lbls {
+		scrape = append(scrape, &sample{
+			labels: m,
+			value:  123456789,
+		})
+	}
+
+	for i := 0; i < scrapeCount; i++ {
+		app := b.storage.Appender()
+		ts += timeDelta
+
+		for _, s := range scrape {
+			s.value += 1000
+
+			if s.ref == nil {
+				ref, err := app.Add(s.labels, ts, float64(s.value))
+				if err != nil {
+					panic(err)
+				}
+				s.ref = &ref
+			} else if err := app.AddFast(*s.ref, ts, float64(s.value)); err != nil {
+
+				if errors.Cause(err) != tsdb.ErrNotFound {
+					panic(err)
+				}
+
+				ref, err := app.Add(s.labels, ts, float64(s.value))
+				if err != nil {
+					panic(err)
+				}
+				s.ref = &ref
+			}
+
+			total++
+		}
+		if err := app.Commit(); err != nil {
+			return total, err
+		}
+	}
+	fmt.Println("single thread ingestion completed")
 
 	return total, nil
 }
